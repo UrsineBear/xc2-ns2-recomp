@@ -928,6 +928,10 @@ bool mirror_enabled() { return mirror_mode() != MirrorMode::Off; }
 
 constexpr uint64_t kMirrorCaptureOverlap = 4ull << 20;   // 4 MiB tail overlap on capture chunks so bindings crossing a stride boundary fit in one chunk
 
+namespace {
+void cap_seed_new_chunk(Mirror& m, size_t ci, uint64_t c_lo, uint64_t c_hi);
+}  // namespace
+
 void mirror_chunk_bounds(const Mirror& m, size_t ci, uint64_t* lo, uint64_t* hi) {
     const uint64_t gran = granule_bytes();
     const uint64_t a = ci * gran;
@@ -980,9 +984,9 @@ VkBuffer mirror_chunk(Mirror& m, uint64_t page) {
     }
     if (ci < m.chunk_host.size()) m.chunk_host[ci] = use_host ? 1 : 0;
     if (mirror_capture_on()) {
-        // Invalidate any pages in [c_lo, c_hi) that were already validated in a neighboring overlapping chunk so cap_ensure populates this chunk too.
-        const uint64_t p0 = c_lo / kPageBytes, p1 = std::min<uint64_t>(c_hi / kPageBytes, m.npages);
-        if (p1 > p0) mem::ww::invalidate(m.ww, p0, p1 - p0);
+        // Seed overlap bands from any already-allocated neighboring chunks instead of invalidating valid pages (which
+        // would overwrite prior GPU-only writes like graphics-stage morph SSBOs with stale host bytes).
+        cap_seed_new_chunk(m, ci, c_lo, c_hi);
     }
     if (!use_host) {
         g_mirror_bytes += bytes;
@@ -1038,8 +1042,11 @@ bool mirror_capture_on() {
 
 namespace {
 struct CapWrite { Mirror* m; uint64_t lo, hi, serial; };     // pool offsets [lo, hi) the GPU writes in the copy
+struct CapOverlap { Mirror* m; size_t src_ci, dst_ci; uint64_t lo, hi; };   // GPU write in src_ci overlapping dst_ci
 std::vector<CapWrite> g_cap_wr;          // render thread: writes not known to be complete (their write-back may not have run)
 std::vector<CapWrite> g_cap_wb;          // render thread: the submission's writes, copied back to the pool at its end
+std::vector<CapOverlap> g_cap_ov;        // render thread: GPU writes into chunk overlap bands awaiting mirror-to-mirror sync
+std::vector<CapOverlap> g_cap_ov_deferred;   // render thread: same-submission overlap writes whose dst_ci was not allocated yet
 VkCommandBuffer g_cap_pc = VK_NULL_HANDLE;   // the prologue the last first-use copy went into
 enum CapEsc { kEscNoPool, kEscBig, kEscNoMirror, kEscNoChunk, kEscUntracked, kEscNoFrame, kEscUpload, kEscCount };
 int64_t g_cap_esc[kEscCount] = {};       // render thread: bindings served from the pool's live bytes, by reason
@@ -1136,9 +1143,103 @@ void cap_note_write(Mirror* m, uint64_t lo, uint64_t hi) {
     g_cap_wb.push_back({m, lo, hi, ser});
     g_cap_wr.push_back({m, lo, hi, ser});
 }
+
+void cap_note_overlap(Mirror* m, size_t src_ci, uint64_t lo, uint64_t hi) {
+    if (m->chunks.size() <= 1 || lo >= hi) return;
+    const uint64_t gran = granule_bytes();
+    auto add = [&](size_t dst_ci, uint64_t ov_lo, uint64_t ov_hi) {
+        if (ov_lo >= ov_hi) return;
+        const bool dst_ready = dst_ci < m->chunks.size() && m->chunks[dst_ci].buffer != VK_NULL_HANDLE;
+        std::vector<CapOverlap>& vec = dst_ready ? g_cap_ov : g_cap_ov_deferred;
+        for (size_t i = vec.size(), k = 0; i-- > 0 && k < 32; ++k) {
+            if (vec[i].m == m && vec[i].src_ci == src_ci && vec[i].dst_ci == dst_ci &&
+                vec[i].lo <= ov_lo && vec[i].hi >= ov_hi)
+                return;
+        }
+        vec.push_back({m, src_ci, dst_ci, ov_lo, ov_hi});
+    };
+    const uint64_t next_lo = (src_ci + 1) * gran;
+    if (src_ci + 1 < m->chunks.size() && hi > next_lo)
+        add(src_ci + 1, std::max(lo, next_lo), hi);
+    if (src_ci > 0) {
+        const uint64_t prev_hi = std::min<uint64_t>(m->pool_bytes, src_ci * gran + kMirrorCaptureOverlap);
+        if (lo < prev_hi)
+            add(src_ci - 1, lo, std::min(hi, prev_hi));
+    }
+}
+
+void cap_seed_new_chunk(Mirror& m, size_t ci, uint64_t c_lo, uint64_t c_hi) {
+    for (size_t i = 0; i < g_cap_ov_deferred.size();) {
+        const CapOverlap& e = g_cap_ov_deferred[i];
+        if (e.m == &m && e.dst_ci == ci) {
+            g_cap_ov.push_back(e);
+            g_cap_ov_deferred[i] = g_cap_ov_deferred.back();
+            g_cap_ov_deferred.pop_back();
+        } else {
+            ++i;
+        }
+    }
+    const uint64_t gran = granule_bytes();
+    const bool has_prev = ci > 0 && m.chunks[ci - 1].buffer != VK_NULL_HANDLE;
+    const bool has_next = ci + 1 < m.chunks.size() && m.chunks[ci + 1].buffer != VK_NULL_HANDLE && c_hi > c_lo + gran;
+    if (!has_prev && !has_next) return;
+    VkCommandBuffer pc = g_cur_frame ? g_cur_frame->prologue() : VK_NULL_HANDLE;
+    if (pc) {
+        memory_barrier(pc);
+        g_cap_pc = pc;
+        if (has_prev) {
+            const uint64_t head_len = std::min<uint64_t>(c_hi - c_lo, kMirrorCaptureOverlap);
+            if (head_len) {
+                const VkBufferCopy cp{gran, 0, head_len};
+                vkCmdCopyBuffer(pc, m.chunks[ci - 1].buffer, m.chunks[ci].buffer, 1, &cp);
+            }
+        }
+        if (has_next) {
+            const uint64_t tail_len = c_hi - (c_lo + gran);
+            if (tail_len) {
+                const VkBufferCopy cp{0, gran, tail_len};
+                vkCmdCopyBuffer(pc, m.chunks[ci + 1].buffer, m.chunks[ci].buffer, 1, &cp);
+            }
+        }
+        memory_barrier(pc);
+    } else {
+        if (has_prev) {
+            const uint64_t p0 = c_lo / kPageBytes;
+            const uint64_t p1 = std::min<uint64_t>((c_lo + std::min<uint64_t>(c_hi - c_lo, kMirrorCaptureOverlap) + kPageBytes - 1) / kPageBytes, m.npages);
+            if (p1 > p0) mem::ww::invalidate(m.ww, p0, p1 - p0);
+        }
+        if (has_next) {
+            const uint64_t p0 = (c_lo + gran) / kPageBytes;
+            const uint64_t p1 = std::min<uint64_t>((c_hi + kPageBytes - 1) / kPageBytes, m.npages);
+            if (p1 > p0) mem::ww::invalidate(m.ww, p0, p1 - p0);
+        }
+    }
+}
 }  // namespace
 
-BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write) {
+bool mirror_capture_has_overlap_sync() { return !g_cap_ov.empty(); }
+
+void mirror_capture_sync_overlaps(VkCommandBuffer cb) {
+    if (g_cap_ov.empty()) return;
+    const uint64_t gran = granule_bytes();
+    bool barrier = false;
+    for (const CapOverlap& e : g_cap_ov) {
+        Mirror* m = e.m;
+        if (!m || e.src_ci >= m->chunks.size() || e.dst_ci >= m->chunks.size()) continue;
+        VkBuffer src = m->chunks[e.src_ci].buffer;
+        VkBuffer dst = m->chunks[e.dst_ci].buffer;
+        if (!src || !dst || e.lo >= e.hi) continue;
+        if (!barrier) { memory_barrier(cb); barrier = true; }
+        const uint64_t src_lo = e.src_ci * gran;
+        const uint64_t dst_lo = e.dst_ci * gran;
+        const VkBufferCopy cp{e.lo - src_lo, e.lo - dst_lo, e.hi - e.lo};
+        vkCmdCopyBuffer(cb, src, dst, 1, &cp);
+    }
+    g_cap_ov.clear();
+    if (barrier) memory_barrier(cb);
+}
+
+BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write, bool writeback) {
     MemoryPool* mp = nullptr;
     PoolGpu* pg = nullptr;
     uint64_t poff = 0;
@@ -1156,7 +1257,12 @@ BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write) {
     if (poff < c_lo || poff + size > c_hi) { g_cap_esc[kEscBig]++; return resolve_in_pool(gpu_address, size, nullptr, nullptr, nullptr, true); }
     if (!cap_ensure(*m, first, last)) return resolve_in_pool(gpu_address, size, nullptr, nullptr, nullptr, true);
     ++g_cap_binds;
-    if (write) { ++g_cap_wbinds; cap_note_write(m, poff, std::min<uint64_t>(poff + size, m->npages * kPageBytes)); }
+    if (write) {
+        ++g_cap_wbinds;
+        const uint64_t end_off = std::min<uint64_t>(poff + size, m->npages * kPageBytes);
+        if (writeback) cap_note_write(m, poff, end_off);
+        cap_note_overlap(m, ci, poff, end_off);
+    }
     out.buffer = cb;
     out.offset = poff - c_lo;
     out.avail = c_hi - poff;
@@ -1176,20 +1282,14 @@ void mirror_capture_update(VkCommandBuffer cb, uint64_t gpu_address, const void*
     const uint64_t first = poff / kPageBytes, last = (poff + size - 1) / kPageBytes;
     if (last >= m.npages || !range_valid(m, first, last - first + 1)) return;   // not in the copy: its first use reads the pool
     const uint64_t end_off = poff + size;
-    bool any = false;
     for (size_t ci = 0; ci < m.chunks.size(); ++ci) {
         if (!m.chunks[ci].buffer) continue;
         uint64_t c_lo = 0, c_hi = 0;
         mirror_chunk_bounds(m, ci, &c_lo, &c_hi);
-        if (poff >= c_lo && end_off <= c_hi) { any = true; break; }
-    }
-    if (!any) return;
-    for (size_t ci = 0; ci < m.chunks.size(); ++ci) {
-        if (!m.chunks[ci].buffer) continue;
-        uint64_t c_lo = 0, c_hi = 0;
-        mirror_chunk_bounds(m, ci, &c_lo, &c_hi);
-        if (poff >= c_lo && end_off <= c_hi)
-            vkCmdUpdateBuffer(cb, m.chunks[ci].buffer, poff - c_lo, size, data);
+        const uint64_t sub_lo = std::max(poff, c_lo), sub_hi = std::min(end_off, c_hi);
+        if (sub_lo < sub_hi)
+            vkCmdUpdateBuffer(cb, m.chunks[ci].buffer, sub_lo - c_lo, static_cast<uint32_t>(sub_hi - sub_lo),
+                              static_cast<const uint8_t*>(data) + (sub_lo - poff));
     }
 }
 
@@ -1345,6 +1445,8 @@ void mirror_capture_begin(Frame& f) {
     NXFT_MIN("mirror.capture", 1000000);
     const auto t0 = std::chrono::steady_clock::now();
     g_cap_pc = VK_NULL_HANDLE;
+    g_cap_ov.clear();
+    g_cap_ov_deferred.clear();
     cap_log();
     std::shared_ptr<MirrorCapture> cap = std::move(g_cap_next);
     g_cap_next.reset();
@@ -1410,6 +1512,8 @@ void mirror_capture_begin(Frame& f) {
 
 // End of a submission (no pass open): what its commands wrote into the copies goes back to the pools before its serial signals.
 void mirror_capture_end(VkCommandBuffer cb) {
+    mirror_capture_sync_overlaps(cb);
+    g_cap_ov_deferred.clear();
     if (g_cap_wb.empty()) return;
     std::sort(g_cap_wb.begin(), g_cap_wb.end(), [](const CapWrite& a, const CapWrite& b) { return a.m != b.m ? a.m < b.m : a.lo < b.lo; });
     memory_barrier(cb);
@@ -1868,6 +1972,13 @@ void mirror_destroy(PoolGpu* p) {
     if (!m) return;
     p->mirror = nullptr;
     out_unregister(m);
+    auto drop_m = [m](auto& v) {
+        v.erase(std::remove_if(v.begin(), v.end(), [m](const auto& e) { return e.m == m; }), v.end());
+    };
+    drop_m(g_cap_ov);
+    drop_m(g_cap_ov_deferred);
+    drop_m(g_cap_wb);
+    drop_m(g_cap_wr);
     std::unique_lock<std::mutex> cap_lk(g_cap_mu);
     g_mirrors.erase(std::remove(g_mirrors.begin(), g_mirrors.end(), m), g_mirrors.end());
     if (m->ww) mem::ww::region_destroy(m->ww);

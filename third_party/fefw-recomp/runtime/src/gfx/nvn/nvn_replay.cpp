@@ -898,7 +898,8 @@ bool end_pass(bool to_pass = false) {
         ft::mark(vb, static_cast<uint32_t>(std::min<uint64_t>(g_pass_verts, 0xffffffffull)));
     }
     bool barrier_emitted = false;
-    if (to_pass && g_tracked && !g_pass_unsafe) {
+    const bool need_ov_sync = mirror_capture_on() && mirror_capture_has_overlap_sync();
+    if (to_pass && g_tracked && !g_pass_unsafe && !need_ov_sync) {
         auto remember = [](Texture* t, VkImageLayout l) {
             if (!t || !tex_gpu(t)) return;
             for (const PendingWrite& w : g_pending) if (w.tex.get() == t) return;
@@ -912,6 +913,7 @@ bool end_pass(bool to_pass = false) {
         if (!P.depth_ro) remember(P.depth.tex, depth_pass_layout(P.depth_ro, P.depth_general));
     } else {
         memory_barrier(F->cb);
+        if (need_ov_sync) mirror_capture_sync_overlaps(F->cb);
         g_pending.clear();
         g_pending_write_mem = false;
         g_wm_last_addr = g_wm_last_size = 0;
@@ -2826,8 +2828,9 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set, PushSet0* out_push
                             // them, so the effects missed their CPU updates every few frames (the waterfall mist blinking at render_scale 3,
                             // where the GPU runs long enough to overlap). The write-back went from ~65 to ~1 MB per second.
                             static const bool gfx_wb = nxrt::config_get_bool("nvn", "mirror_gfx_storage_writeback", true);
-                            const bool wr = !(ro_cap && d.nvn_stage != kCompute && !b.written) && (gfx_wb || d.nvn_stage == kCompute);
-                            const BufRef cr = mirror_capture_bind(bind.addr, bi.range, wr);
+                            const bool gpu_wr = !(ro_cap && d.nvn_stage != kCompute && !b.written);
+                            const bool host_wb = gpu_wr && (gfx_wb || d.nvn_stage == kCompute);
+                            const BufRef cr = mirror_capture_bind(bind.addr, bi.range, gpu_wr, host_wb);
                             if (cr.ok && cr.buffer != br.buffer) {
                                 bi.buffer = cr.buffer;
                                 bi.offset = cr.offset;
@@ -6047,6 +6050,7 @@ void do_dispatch(uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
     draw_ring_note_dispatch(*cs, x, y, z, indirect != 0);
     shadows_after_dispatch();
     memory_barrier(F->cb);
+    if (mirror_capture_on() && mirror_capture_has_overlap_sync()) mirror_capture_sync_overlaps(F->cb);
     if (g_trace) trace_snap_after_dispatch(*cs, *pl);
     g_cs_c0 = UploadAlloc();
     invalidate_bound_state();
@@ -6109,6 +6113,7 @@ void report_from_query(uint64_t address, uint64_t timestamp, VkQueryPool qp, int
             const VkBufferCopy c{copy.offset, pool.offset, sizeof rep};
             vkCmdCopyBuffer(F->cb, copy.buffer, pool.buffer, 1, &c);
             memory_barrier(F->cb);
+            if (mirror_capture_has_overlap_sync()) mirror_capture_sync_overlaps(F->cb);
             gstamp("report");
             return;
         }
@@ -7185,7 +7190,8 @@ void run_list(const CmdList& list, int depth) {
                 // (e.g. 0x14 = ORDER_FRAGMENTS_TILED | INVALIDATE_TEXTURE) only needs a narrow color-to-sampled barrier
                 // between dynamic rendering passes (no FbClone copy, no ALL_COMMANDS stall, and spec-valid without
                 // VK_KHR_dynamic_rendering_local_read).
-                if (P.open && P.color_feedback != 0 && !P.depth_ro && P.color_general == 0 &&
+                const bool need_ov_sync = mirror_capture_on() && mirror_capture_has_overlap_sync();
+                if (!need_ov_sync && P.open && P.color_feedback != 0 && !P.depth_ro && P.color_general == 0 &&
                     (pb.bits & ~(0x01u | 0x02u | 0x04u | 0x10u)) == 0) {
                     Texture* fb_color[8] = {};
                     const uint32_t fb_n = std::min<uint32_t>(P.ncolor, 8u);
@@ -7209,7 +7215,7 @@ void run_list(const CmdList& list, int depth) {
                     break;
                 }
                 if (P.open) {
-                    if (barrier_keeps_pass()) {
+                    if (barrier_keeps_pass() && !need_ov_sync) {
                         memory_barrier_in_pass(F->cb);
                         g_pass_unsafe = true;
                     } else {
@@ -7217,6 +7223,7 @@ void run_list(const CmdList& list, int depth) {
                     }
                 } else {
                     memory_barrier(F->cb);
+                    if (need_ov_sync) mirror_capture_sync_overlaps(F->cb);
                     g_pending.clear();
                     g_pending_write_mem = false;
                     g_wm_last_addr = g_wm_last_size = 0;

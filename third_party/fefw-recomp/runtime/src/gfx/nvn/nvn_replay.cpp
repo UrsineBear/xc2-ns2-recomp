@@ -2826,8 +2826,10 @@ VkDescriptorSet build_set(const ProgLayout& pl, uint32_t set, PushSet0* out_push
                             // them, so the effects missed their CPU updates every few frames (the waterfall mist blinking at render_scale 3,
                             // where the GPU runs long enough to overlap). The write-back went from ~65 to ~1 MB per second.
                             static const bool gfx_wb = nxrt::config_get_bool("nvn", "mirror_gfx_storage_writeback", true);
-                            const bool wr = !(ro_cap && d.nvn_stage != kCompute && !b.written) && (gfx_wb || d.nvn_stage == kCompute);
-                            const BufRef cr = mirror_capture_bind(bind.addr, bi.range, wr);
+                            const bool gpu_written = !(ro_cap && d.nvn_stage != kCompute && !b.written);
+                            const bool wr = gpu_written && (gfx_wb || d.nvn_stage == kCompute);
+                            const bool gfx_no_wb = gpu_written && !wr;
+                            const BufRef cr = mirror_capture_bind(bind.addr, bi.range, wr, gfx_no_wb);
                             if (cr.ok && cr.buffer != br.buffer) {
                                 bi.buffer = cr.buffer;
                                 bi.offset = cr.offset;

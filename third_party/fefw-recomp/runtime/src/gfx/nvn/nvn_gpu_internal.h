@@ -173,7 +173,7 @@ void mirror_end_submit();   // [nvn] mirror_cpu_snapshot: no submission is recor
 void mirror_destroy(PoolGpu* p);
 // [nvn] mirror_capture (nvn_gpu_pool.cpp): every GPU access to a mirrored pool goes through its copy, filled from submit-time captures
 bool mirror_capture_on();
-BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write);
+BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write, bool gfx_no_wb = false);
 void mirror_capture_update(VkCommandBuffer cb, uint64_t gpu_address, const void* data, uint32_t size);
 void mirror_capture_begin(Frame& f);
 std::shared_ptr<void> mirror_capture_take();          // game thread, in the submit call (null: no submit-time capture)

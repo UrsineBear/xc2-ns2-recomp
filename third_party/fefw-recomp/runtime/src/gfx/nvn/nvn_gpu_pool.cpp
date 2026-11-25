@@ -538,6 +538,11 @@ void pool_gpu_destroy(PoolGpu* p) {
 //
 // [nvn] pool_mirror = on (default) | off.
 // The copy is made of pool_import_granule_mb chunks (64 MiB by default), each created the first time a draw wants one of its pages.
+struct GfxPartial {
+    uint64_t lo = 0, hi = 0;         // unaligned sub-page range [lo, hi) within one 4 KiB page (hi - lo < kPageBytes)
+    uint64_t last_seen = 0;          // submission serial when last bound as a written graphics SSBO
+    std::vector<uint8_t> shadow;     // host bytes of pg->base[lo..hi) when registered
+};
 struct Mirror {
     std::vector<gfx::Buffer> chunks;    // the copy, granule_bytes() each (plus overlap when mirror_capture is on); empty until a draw wants a page in it
     std::vector<uint8_t> chunk_host;    // 1 when chunks[i] is backed by host upload memory (VRAM budget fallback)
@@ -560,6 +565,9 @@ struct Mirror {
     std::vector<uint32_t> cpu_wr_at;    // present count when a CPU write to the page was last seen (0: never): dynamic data, snapshot it
     std::vector<uint64_t> gpu_wr;       // serial of the submission that last wrote the page on the GPU (0: never): CPU snapshots wait for it
     uint64_t cap_id = 0;                // [nvn] mirror_capture: unique id (a game-thread capture names its mirror by pointer and id)
+    // [nvn] mirror_capture + mirror_gfx_storage_writeback = 0: GPU-written graphics SSBO boundary sub-pages (keyed by page index, under g_cap_mu)
+    // so neighbouring CPU UBO writes on the same 4 KiB page do not overwrite unchanged GPU-owned bytes (e.g. XC2 facial morph vertices) with stale host memory.
+    std::unordered_map<uint64_t, std::vector<GfxPartial>> gfx_partial;
 };
 namespace { std::mutex g_cap_mu; uint64_t g_cap_next_id = 0; }   // [nvn] mirror_capture: g_mirrors changes vs game-thread captures
 
@@ -1045,7 +1053,7 @@ enum CapEsc { kEscNoPool, kEscBig, kEscNoMirror, kEscNoChunk, kEscUntracked, kEs
 int64_t g_cap_esc[kEscCount] = {};       // render thread: bindings served from the pool's live bytes, by reason
 int64_t g_cap_pool_writes = 0;
 int64_t g_cap_again = 0;
-std::atomic<int64_t> g_cap_take_ns{0}, g_cap_take_poll_ns{0}, g_cap_take_copy_ns{0}, g_cap_take_n{0}, g_cap_take_bytes{0};   // game thread (mirror_capture_take)
+std::atomic<int64_t> g_cap_take_ns{0}, g_cap_take_poll_ns{0}, g_cap_take_copy_ns{0}, g_cap_take_n{0}, g_cap_take_bytes{0}, g_cap_gfx_partial_skip{0};   // game thread (mirror_capture_take)
 int64_t g_cap_apply_ns = 0, g_cap_ensure_ns = 0;                                // render thread                 // render thread: first-use bytes of pages that had been in the copy before          // render thread: GPU writes into a mirrored pool that did not go through the copy
 int64_t g_cap_binds = 0, g_cap_wbinds = 0, g_cap_first = 0, g_cap_poll = 0, g_cap_excl = 0, g_cap_wbb = 0, g_cap_wbn = 0;
 
@@ -1054,9 +1062,10 @@ void cap_log() {
     const auto now = std::chrono::steady_clock::now();
     if (now - last < std::chrono::seconds(10)) return;
     last = now;
-    NXLOG_I(kTag, "mirror_capture, last 10 s: binds %lld (writes %lld); first-use copies %lld KiB; CPU writes captured %lld KiB, in-flight GPU bytes left out %lld KiB; "
+    const int64_t subpage_kept = g_cap_gfx_partial_skip.exchange(0, std::memory_order_relaxed);
+    NXLOG_I(kTag, "mirror_capture, last 10 s: binds %lld (writes %lld); first-use copies %lld KiB; CPU writes captured %lld KiB, in-flight GPU bytes left out %lld KiB (sub-page %lld KiB); "
             "written back %lld KiB in %lld ranges; GPU writes to the pool itself %lld; LIVE reads (escapes): no pool %lld, >64 MiB %lld, no mirror %lld, no chunk %lld, untracked %lld, no frame %lld, no upload %lld",
-            (long long)g_cap_binds, (long long)g_cap_wbinds, (long long)(g_cap_first >> 10), (long long)(g_cap_poll >> 10), (long long)(g_cap_excl >> 10),
+            (long long)g_cap_binds, (long long)g_cap_wbinds, (long long)(g_cap_first >> 10), (long long)(g_cap_poll >> 10), (long long)(g_cap_excl >> 10), (long long)(subpage_kept >> 10),
             (long long)(g_cap_wbb >> 10), (long long)g_cap_wbn, (long long)g_cap_pool_writes, (long long)g_cap_esc[0], (long long)g_cap_esc[1], (long long)g_cap_esc[2], (long long)g_cap_esc[3],
             (long long)g_cap_esc[4], (long long)g_cap_esc[5], (long long)g_cap_esc[6]);
     uint64_t forgot = 0, pollfail = 0;
@@ -1136,9 +1145,125 @@ void cap_note_write(Mirror* m, uint64_t lo, uint64_t hi) {
     g_cap_wb.push_back({m, lo, hi, ser});
     g_cap_wr.push_back({m, lo, hi, ser});
 }
+
+// [nvn] mirror_capture + mirror_gfx_storage_writeback = 0:
+// Graphics-stage SSBO writes (e.g. XC2 facial morph vertex shaders) stay in the device-local mirror without host
+// write-back, so host RAM still holds the initial pre-morph bytes. When such an SSBO's head or tail shares a 4 KiB
+// page with an unrelated CPU-written buffer (e.g. per-frame material UBOs), CPU writes to the neighbour dirty the
+// whole 4 KiB page and submit-time capture would overwrite the unaligned GPU-owned vertices with stale host bytes.
+// Record each partial boundary sub-range (< 4 KiB) with a snapshot of its host bytes at bind time: when a dirty page
+// is captured, unchanged sub-ranges are excluded from the copy while any CPU-modified sub-range is dropped and copied.
+void cap_note_gfx_partial(Mirror* m, uint64_t lo, uint64_t hi) {
+    if (lo >= hi) return;
+    const uint64_t p_first = lo / kPageBytes, p_last = (hi - 1) / kPageBytes;
+    const bool head_partial = (lo % kPageBytes != 0) || (p_first == p_last && (hi - lo) < kPageBytes);
+    const bool tail_partial = (p_last > p_first) && (hi % kPageBytes != 0);
+    if (!head_partial && !tail_partial) return;
+
+    struct SeenKey { uint64_t cap_id, lo, hi; };
+    static uint64_t seen_ser = 0;
+    static std::vector<SeenKey> seen;
+    const uint64_t ser = current_serial();
+    if (ser != seen_ser) { seen_ser = ser; seen.clear(); }
+    for (const SeenKey& k : seen)
+        if (k.cap_id == m->cap_id && k.lo == lo && k.hi == hi) return;
+    seen.push_back({m->cap_id, lo, hi});
+
+    auto register_sub = [&](uint64_t page, uint64_t sub_lo, uint64_t sub_hi) {
+        if (sub_lo >= sub_hi || (sub_hi - sub_lo) >= kPageBytes) return;
+        auto& vec = m->gfx_partial[page];
+        for (GfxPartial& e : vec) {
+            if (e.lo <= sub_lo && e.hi >= sub_hi) { e.last_seen = ser; return; }
+        }
+        vec.erase(std::remove_if(vec.begin(), vec.end(), [&](const GfxPartial& e) {
+            return e.lo < sub_hi && sub_lo < e.hi;
+        }), vec.end());
+        GfxPartial gp;
+        gp.lo = sub_lo;
+        gp.hi = sub_hi;
+        gp.last_seen = ser;
+        const size_t n = static_cast<size_t>(sub_hi - sub_lo);
+        gp.shadow.resize(n);
+        std::memcpy(gp.shadow.data(), m->pg->base + sub_lo, n);
+        vec.push_back(std::move(gp));
+    };
+
+    std::lock_guard<std::mutex> lk(g_cap_mu);
+    if (p_first == p_last) {
+        register_sub(p_first, lo, hi);
+    } else {
+        if (lo % kPageBytes != 0) register_sub(p_first, lo, (p_first + 1) * kPageBytes);
+        if (hi % kPageBytes != 0) register_sub(p_last, p_last * kPageBytes, hi);
+    }
+    if (m->gfx_partial.size() > 512 && ser > 2048) {
+        const uint64_t cutoff = ser - 2048;
+        for (auto it = m->gfx_partial.begin(); it != m->gfx_partial.end();) {
+            auto& vec = it->second;
+            vec.erase(std::remove_if(vec.begin(), vec.end(), [cutoff](const GfxPartial& e) { return e.last_seen < cutoff; }), vec.end());
+            if (vec.empty()) it = m->gfx_partial.erase(it);
+            else ++it;
+        }
+    }
+}
+
+// Called under g_cap_mu before copying dirty host page run [lo, hi).
+// Splits [lo, hi) around any tracked GfxPartial whose host bytes are unchanged since registration.
+void cap_filter_gfx_partial(Mirror& m, uint64_t lo, uint64_t hi, std::vector<std::pair<uint64_t, uint64_t>>& out) {
+    out.clear();
+    if (m.gfx_partial.empty()) {
+        out.emplace_back(lo, hi);
+        return;
+    }
+    static thread_local std::vector<std::pair<uint64_t, uint64_t>> skip;
+    skip.clear();
+    const uint64_t p_first = lo / kPageBytes, p_last = (hi - 1) / kPageBytes;
+    auto check_page = [&](std::vector<GfxPartial>& vec) {
+        for (size_t i = 0; i < vec.size();) {
+            const GfxPartial& gp = vec[i];
+            const size_t n = static_cast<size_t>(gp.hi - gp.lo);
+            if (std::memcmp(m.pg->base + gp.lo, gp.shadow.data(), n) == 0) {
+                skip.emplace_back(gp.lo, gp.hi);
+                ++i;
+            } else {
+                vec.erase(vec.begin() + static_cast<ptrdiff_t>(i));
+            }
+        }
+    };
+    if ((p_last - p_first + 1) <= m.gfx_partial.size()) {
+        for (uint64_t p = p_first; p <= p_last; ++p) {
+            auto it = m.gfx_partial.find(p);
+            if (it == m.gfx_partial.end()) continue;
+            check_page(it->second);
+            if (it->second.empty()) m.gfx_partial.erase(it);
+        }
+    } else {
+        for (auto it = m.gfx_partial.begin(); it != m.gfx_partial.end();) {
+            if (it->first < p_first || it->first > p_last) { ++it; continue; }
+            check_page(it->second);
+            if (it->second.empty()) it = m.gfx_partial.erase(it);
+            else ++it;
+        }
+    }
+    if (skip.empty()) {
+        out.emplace_back(lo, hi);
+        return;
+    }
+    std::sort(skip.begin(), skip.end());
+    uint64_t a = lo;
+    int64_t skipped_bytes = 0;
+    for (const auto& s : skip) {
+        if (s.second <= a || s.first >= hi) continue;
+        if (s.first > a) out.emplace_back(a, s.first);
+        skipped_bytes += static_cast<int64_t>(std::min(s.second, hi) - std::max(s.first, a));
+        a = std::max(a, s.second);
+        if (a >= hi) break;
+    }
+    if (a < hi) out.emplace_back(a, hi);
+    if (skipped_bytes > 0) g_cap_gfx_partial_skip.fetch_add(skipped_bytes, std::memory_order_relaxed);
+}
 }  // namespace
 
-BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write) {
+BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write, bool gfx_no_wb) {
     MemoryPool* mp = nullptr;
     PoolGpu* pg = nullptr;
     uint64_t poff = 0;
@@ -1156,7 +1281,9 @@ BufRef mirror_capture_bind(uint64_t gpu_address, uint64_t size, bool write) {
     if (poff < c_lo || poff + size > c_hi) { g_cap_esc[kEscBig]++; return resolve_in_pool(gpu_address, size, nullptr, nullptr, nullptr, true); }
     if (!cap_ensure(*m, first, last)) return resolve_in_pool(gpu_address, size, nullptr, nullptr, nullptr, true);
     ++g_cap_binds;
-    if (write) { ++g_cap_wbinds; cap_note_write(m, poff, std::min<uint64_t>(poff + size, m->npages * kPageBytes)); }
+    const uint64_t end_off = std::min<uint64_t>(poff + size, m->npages * kPageBytes);
+    if (write) { ++g_cap_wbinds; cap_note_write(m, poff, end_off); }
+    else if (gfx_no_wb) { cap_note_gfx_partial(m, poff, end_off); }
     out.buffer = cb;
     out.offset = poff - c_lo;
     out.avail = c_hi - poff;
@@ -1261,23 +1388,27 @@ std::shared_ptr<void> mirror_capture_take() {
         poll_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(tp1 - tp0).count();
         if (pages.empty()) continue;
         if (!std::is_sorted(pages.begin(), pages.end())) std::sort(pages.begin(), pages.end());
+        static thread_local std::vector<std::pair<uint64_t, uint64_t>> spans;
         for (size_t i = 0; i < pages.size();) {
             size_t j = i + 1;
             while (j < pages.size() && pages[j] == pages[j - 1] + 1) ++j;
-            const uint64_t lo = pages[i] * kPageBytes, hi = (pages[j - 1] + 1) * kPageBytes, len = hi - lo;
-            if (!a || a->used + len > a->buf.size) {
-                a = arena_get(len);
-                if (a) cap->arenas.push_back(a);
+            const uint64_t lo = pages[i] * kPageBytes, hi = (pages[j - 1] + 1) * kPageBytes;
+            cap_filter_gfx_partial(m, lo, hi, spans);
+            for (const auto& sp : spans) {
+                const uint64_t sp_lo = sp.first, sp_hi = sp.second, len = sp_hi - sp_lo;
+                if (!a || a->used + len > a->buf.size) {
+                    a = arena_get(len);
+                    if (a) cap->arenas.push_back(a);
+                }
+                if (!a) {
+                    for (size_t k = i; k < j; ++k) cap->lost.emplace_back(mp, pages[k]);
+                    break;
+                }
+                std::memcpy(static_cast<uint8_t*>(a->buf.mapped) + a->used, m.pg->base + sp_lo, static_cast<size_t>(len));
+                cap->runs.push_back({mp, m.cap_id, sp_lo, sp_hi, a, a->used});
+                a->used += (len + 255) & ~uint64_t{255};
+                g_cap_take_bytes.fetch_add(static_cast<int64_t>(len), std::memory_order_relaxed);
             }
-            if (!a) {
-                for (size_t k = i; k < j; ++k) cap->lost.emplace_back(mp, pages[k]);
-                i = j;
-                continue;
-            }
-            std::memcpy(static_cast<uint8_t*>(a->buf.mapped) + a->used, m.pg->base + lo, static_cast<size_t>(len));
-            cap->runs.push_back({mp, m.cap_id, lo, hi, a, a->used});
-            a->used += (len + 255) & ~uint64_t{255};
-            g_cap_take_bytes.fetch_add(static_cast<int64_t>(len), std::memory_order_relaxed);
             i = j;
         }
         copy_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tp1).count();
@@ -1388,19 +1519,26 @@ void mirror_capture_begin(Frame& f) {
         if (pages.empty() || !any_chunk) continue;
         std::sort(pages.begin(), pages.end());
         excl_for(mp, done_now, excl);
+        static std::vector<std::pair<uint64_t, uint64_t>> spans;
         for (size_t i = 0; i < pages.size();) {
             size_t j = i + 1;
             while (j < pages.size() && pages[j] == pages[j - 1] + 1) ++j;
             const uint64_t lo = pages[i] * kPageBytes, hi = (pages[j - 1] + 1) * kPageBytes;
-            UploadAlloc u = f.upload(hi - lo, 256);
-            if (!u) {   // no room: these pages are not current in the copy any more; their next use copies them again
-                for (size_t k = i; k < j; ++k) mem::ww::release_written(m.ww, pages[k]);
-                i = j;
-                continue;
+            {
+                std::lock_guard<std::mutex> lk(g_cap_mu);
+                cap_filter_gfx_partial(m, lo, hi, spans);
             }
-            std::memcpy(u.ptr, m.pg->base + lo, static_cast<size_t>(hi - lo));
-            g_cap_poll += static_cast<int64_t>(hi - lo);
-            cap_put(f.cb, barrier, m, u.buffer, u.offset, lo, hi, excl);
+            for (const auto& sp : spans) {
+                const uint64_t sp_lo = sp.first, sp_hi = sp.second, len = sp_hi - sp_lo;
+                UploadAlloc u = f.upload(len, 256);
+                if (!u) {   // no room: these pages are not current in the copy any more; their next use copies them again
+                    for (size_t k = i; k < j; ++k) mem::ww::release_written(m.ww, pages[k]);
+                    break;
+                }
+                std::memcpy(u.ptr, m.pg->base + sp_lo, static_cast<size_t>(len));
+                g_cap_poll += static_cast<int64_t>(len);
+                cap_put(f.cb, barrier, m, u.buffer, u.offset, sp_lo, sp_hi, excl);
+            }
             i = j;
         }
     }

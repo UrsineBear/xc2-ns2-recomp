@@ -22,6 +22,7 @@ An ahead-of-time ("static") recompilation of the **Nintendo Switch 2 program of 
 > [!IMPORTANT]
 > **This repository contains no game code, game assets, or cryptographic keys.**
 > Release packages ship only the open-source launcher, generic runtime (`xc2_rt.dll`), and build toolchain. Game-derived builds (`xc2_boot.exe`, lifted game code) and translated shader caches (`.spv`) are never distributed — they are built locally on your own PC from your own legally acquired copy of the game.
+> **Official releases are published exclusively on this repository's [GitHub Releases](https://github.com/weile10000/xc2-ns2-recomp/releases).** Any third-party videos, file-sharing links, or repacks bundling game files are completely unaffiliated with this project.
 
 ## Target Program
 
@@ -170,6 +171,7 @@ Requirements: **Native Windows 11 x64** *(primary target covered by release test
 > [!IMPORTANT]
 > **本仓库不包含任何游戏本体代码、美术资源或解密密钥。**
 > 发行包仅分发开源启动器、通用运行时（`xc2_rt.dll`）与构建工具链；任何包含举升后游戏代码的可执行程序（`xc2_boot.exe`）与着色器缓存（`.spv`）从不随包分发，必须由你在自己电脑上使用合法持有的游戏副本现场构建。
+> **本项目唯一官方发布渠道为本仓库 [GitHub Releases](https://github.com/weile10000/xc2-ns2-recomp/releases)。** 任何第三方视频、群聊或网盘附带的游戏本体资源与整合包均与本项目无任何关联。
 
 ## 目标程序信息
 
